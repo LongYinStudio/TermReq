@@ -84,6 +84,58 @@ func TestCalculateLayoutContentFitsAllocatedHeight(t *testing.T) {
 	}
 }
 
+func TestHistorySelectionLoadsRequestIntoEditor(t *testing.T) {
+	model := newUIModelWithHistory("", []HistoryEntry{
+		{
+			Request: RequestSpec{
+				Method:  "POST",
+				URL:     "https://api.example.test/widgets",
+				Timeout: "5s",
+				Headers: []headerPair{{Key: "Authorization", Value: "Bearer token"}},
+				Body:    `{"name":"demo"}`,
+			},
+		},
+	})
+	model.focus = focusHistory
+
+	if handled := model.applySelectedHistory(); !handled {
+		t.Fatalf("expected history load to be handled")
+	}
+	if got := model.methods[model.methodIndex]; got != "POST" {
+		t.Fatalf("expected method POST, got %q", got)
+	}
+	if got := model.urlInput.Value(); got != "https://api.example.test/widgets" {
+		t.Fatalf("unexpected URL: %q", got)
+	}
+	if got := model.timeoutInput.Value(); got != "5s" {
+		t.Fatalf("unexpected timeout: %q", got)
+	}
+	if got := model.bodyInput.Value(); got != `{"name":"demo"}` {
+		t.Fatalf("unexpected body: %q", got)
+	}
+	if len(model.headerRows) != 1 || model.headerRows[0].keyInput.Value() != "Authorization" {
+		t.Fatalf("expected imported header row, got %+v", model.headerRows)
+	}
+}
+
+func TestHistoryDeleteRemovesEntry(t *testing.T) {
+	model := newUIModelWithHistory("", []HistoryEntry{
+		{Request: RequestSpec{Method: "GET", URL: "https://example.com/one"}},
+		{Request: RequestSpec{Method: "GET", URL: "https://example.com/two"}},
+	})
+	model.selectedHistory = 1
+
+	if handled := model.deleteSelectedHistory(); !handled {
+		t.Fatalf("expected history delete to be handled")
+	}
+	if len(model.historyEntries) != 1 {
+		t.Fatalf("expected one history entry, got %d", len(model.historyEntries))
+	}
+	if got := model.historyEntries[0].Request.URL; got != "https://example.com/one" {
+		t.Fatalf("unexpected remaining history URL: %q", got)
+	}
+}
+
 func TestViewShowsShortcutStrip(t *testing.T) {
 	model := newUIModel()
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 140, Height: 32})

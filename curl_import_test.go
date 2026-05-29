@@ -135,3 +135,120 @@ func findImportedHeader(headers []headerPair, key string) string {
 	}
 	return ""
 }
+
+func TestExportCurlCommandSimpleGet(t *testing.T) {
+	spec := RequestSpec{
+		Method:  "GET",
+		URL:     "https://example.com/api/items",
+		Timeout: "30s",
+	}
+
+	curlCmd := exportCurlCommand(spec)
+	expected := "curl --max-time 30 https://example.com/api/items"
+	if curlCmd != expected {
+		t.Fatalf("expected %q, got %q", expected, curlCmd)
+	}
+}
+
+func TestExportCurlCommandPostWithHeadersAndBody(t *testing.T) {
+	spec := RequestSpec{
+		Method:  "POST",
+		URL:     "https://api.example.com/data",
+		Timeout: "10s",
+		Headers: []headerPair{
+			{Key: "Content-Type", Value: "application/json"},
+			{Key: "Authorization", Value: "Bearer token123"},
+		},
+		Body: `{"key":"value"}`,
+	}
+
+	curlCmd := exportCurlCommand(spec)
+	t.Logf("Generated cURL: %s", curlCmd)
+
+	if !strings.Contains(curlCmd, "curl -X POST") {
+		t.Fatal("expected -X POST")
+	}
+	if !strings.Contains(curlCmd, "--max-time 10") {
+		t.Fatal("expected --max-time 10")
+	}
+	if !strings.Contains(curlCmd, "-H 'Content-Type: application/json'") {
+		t.Fatal("expected Content-Type header")
+	}
+	if !strings.Contains(curlCmd, "-H 'Authorization: Bearer token123'") {
+		t.Fatal("expected Authorization header")
+	}
+	if !strings.Contains(curlCmd, "-d '{\"key\":\"value\"}'") {
+		t.Fatal("expected -d with body")
+	}
+	if !strings.Contains(curlCmd, "https://api.example.com/data") {
+		t.Fatal("expected URL")
+	}
+}
+
+func TestExportCurlCommandGetWithoutTimeout(t *testing.T) {
+	spec := RequestSpec{
+		Method: "GET",
+		URL:    "https://example.com",
+	}
+
+	curlCmd := exportCurlCommand(spec)
+	if strings.Contains(curlCmd, "--max-time") {
+		t.Fatal("expected no --max-time when timeout is empty")
+	}
+}
+
+func TestExportCurlCommandURLWithSpecialChars(t *testing.T) {
+	spec := RequestSpec{
+		Method: "GET",
+		URL:    "https://example.com/path?a=1&b=2",
+	}
+
+	curlCmd := exportCurlCommand(spec)
+	if !strings.Contains(curlCmd, "https://example.com/path?a=1&b=2") {
+		t.Fatal("expected URL with query params")
+	}
+}
+
+func TestExportCurlCommandURLWithSpaces(t *testing.T) {
+	spec := RequestSpec{
+		Method: "GET",
+		URL:    "https://example.com/path with spaces",
+	}
+
+	curlCmd := exportCurlCommand(spec)
+	if !strings.Contains(curlCmd, "'https://example.com/path with spaces'") {
+		t.Fatal("expected URL to be quoted")
+	}
+}
+
+func TestExportCurlCommandRoundTrip(t *testing.T) {
+	raw := `curl -X POST 'https://api.example.com/data' -H 'Content-Type: application/json' -d '{"hello":"world"}'`
+
+	imported, err := parseCurlCommand(raw)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	spec := RequestSpec{
+		Method:  imported.Method,
+		URL:     imported.URL,
+		Timeout: "30s",
+		Headers: imported.Headers,
+		Body:    imported.Body,
+	}
+
+	exported := exportCurlCommand(spec)
+
+	if !strings.Contains(exported, "-X POST") {
+		t.Fatal("round trip lost method")
+	}
+	if !strings.Contains(exported, "https://api.example.com/data") {
+		t.Fatal("round trip lost URL")
+	}
+	if !strings.Contains(exported, "-H 'Content-Type: application/json'") {
+		t.Fatal("round trip lost header")
+	}
+	if !strings.Contains(exported, "-d") {
+		t.Fatal("round trip lost body")
+	}
+}

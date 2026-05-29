@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -25,7 +26,19 @@ func NewApp(stdin, stdout *os.File) *App {
 }
 
 func (a *App) Run() error {
-	model := newUIModel()
+	historyPath, historyPathErr := defaultHistoryPath()
+	historyEntries, historyLoadErr := loadHistory(historyPath)
+
+	model := newUIModelWithHistory(historyPath, historyEntries)
+	switch {
+	case historyPathErr != nil:
+		model.message = fmt.Sprintf("History unavailable: %v", historyPathErr)
+		model.messageLevel = "error"
+	case historyLoadErr != nil:
+		model.message = fmt.Sprintf("History unavailable: %v", historyLoadErr)
+		model.messageLevel = "error"
+	}
+
 	program := tea.NewProgram(
 		model,
 		tea.WithAltScreen(),
@@ -45,6 +58,7 @@ const (
 	focusHeaderKey
 	focusHeaderValue
 	focusBody
+	focusHistory
 	focusResponse
 )
 
@@ -59,7 +73,8 @@ const (
 )
 
 type requestDoneMsg struct {
-	result requestResult
+	result  requestResult
+	request RequestSpec
 }
 
 type uiKeyMap struct {
@@ -75,6 +90,10 @@ type uiKeyMap struct {
 	ResponseNav       key.Binding
 	FormatJSON        key.Binding
 	PasteCurl         key.Binding
+	ExportCurl        key.Binding
+	HistoryNav        key.Binding
+	ApplyHistory      key.Binding
+	DeleteHistory     key.Binding
 }
 
 func newUIKeyMap() uiKeyMap {
@@ -91,6 +110,10 @@ func newUIKeyMap() uiKeyMap {
 		ResponseNav:       key.NewBinding(key.WithKeys("up", "down", "pgup", "pgdown", "home", "end"), key.WithHelp("pgup/dn", "scroll")),
 		FormatJSON:        key.NewBinding(key.WithKeys("ctrl+p"), key.WithHelp("ctrl+p", "format json")),
 		PasteCurl:         key.NewBinding(key.WithKeys("paste cURL"), key.WithHelp("paste cURL", "import")),
+		ExportCurl:        key.NewBinding(key.WithKeys("ctrl+e"), key.WithHelp("ctrl+e", "export cURL")),
+		HistoryNav:        key.NewBinding(key.WithKeys("up", "down", "j", "k"), key.WithHelp("↑/↓", "history")),
+		ApplyHistory:      key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "load history")),
+		DeleteHistory:     key.NewBinding(key.WithKeys("ctrl+d"), key.WithHelp("ctrl+d", "drop history")),
 	}
 }
 
@@ -133,6 +156,9 @@ type uiModel struct {
 	responseView      viewport.Model
 	help              help.Model
 	keys              uiKeyMap
+	historyPath       string
+	historyEntries    []HistoryEntry
+	selectedHistory   int
 
 	message      string
 	messageLevel string
@@ -143,6 +169,10 @@ type uiModel struct {
 }
 
 func newUIModel() uiModel {
+	return newUIModelWithHistory("", nil)
+}
+
+func newUIModelWithHistory(historyPath string, historyEntries []HistoryEntry) uiModel {
 	urlInput := newTextInput("https://httpbin.org/get")
 	timeoutInput := newTextInput("30s")
 	bodyInput := newTextArea("")
@@ -163,11 +193,15 @@ func newUIModel() uiModel {
 		responseView:      responseView,
 		help:              newHelpModel(),
 		keys:              newUIKeyMap(),
+		historyPath:       historyPath,
+		historyEntries:    append([]HistoryEntry(nil), historyEntries...),
+		selectedHistory:   0,
 		message:           "Ready. Paste a browser cURL anywhere to import, Ctrl+S sends.",
 		messageLevel:      "info",
 		response:          placeholderResponse(),
 	}
 
+	model.normalizeHistorySelection()
 	model.syncFocus()
 	return model
 }
@@ -232,6 +266,10 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.response = msg.result.view
 		m.message = msg.result.message
 		m.messageLevel = msg.result.level
+		if err := m.appendHistory(msg.request); err != nil {
+			m.message = fmt.Sprintf("%s (history save failed: %v)", msg.result.message, err)
+			m.messageLevel = "error"
+		}
 		m.rebuildResponseContent()
 		return m, nil
 
@@ -253,6 +291,8 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case key.Matches(msg, m.keys.Send):
 			return m.handleSend()
+		case key.Matches(msg, m.keys.ExportCurl):
+			return m.handleExportCurl()
 		}
 
 		if handled := m.handleFocusedKey(msg); handled {
@@ -276,6 +316,7 @@ func (m uiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.headerRows[m.selectedHeaderRow] = row
 	case focusBody:
 		m.bodyInput, cmd = m.bodyInput.Update(msg)
+	case focusHistory:
 	case focusResponse:
 		m.responseView, cmd = m.responseView.Update(msg)
 	}
@@ -290,8 +331,7 @@ func (m *uiModel) handleSend() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	timeout, err := parseTimeoutValue(m.timeoutInput.Value())
-	if err != nil {
+	if _, err := parseTimeoutValue(m.timeoutInput.Value()); err != nil {
 		m.response = requestErrorResult(err).view
 		m.message = err.Error()
 		m.messageLevel = "error"
@@ -303,13 +343,205 @@ func (m *uiModel) handleSend() (tea.Model, tea.Cmd) {
 	m.message = fmt.Sprintf("Sending %s %s", m.methods[m.methodIndex], strings.TrimSpace(m.urlInput.Value()))
 	m.messageLevel = "info"
 
+	request := m.currentRequestSpec()
+
 	return m, requestCmd(
-		m.methods[m.methodIndex],
-		m.urlInput.Value(),
-		timeout,
-		m.headerLines(),
-		m.bodyInput.Value(),
+		request,
 	)
+}
+
+func (m *uiModel) handleExportCurl() (tea.Model, tea.Cmd) {
+	request := m.currentRequestSpec()
+	curlCmd := exportCurlCommand(request)
+
+	if err := copyToClipboard(curlCmd); err != nil {
+		m.message = fmt.Sprintf("Export failed: %v", err)
+		m.messageLevel = "error"
+		return m, nil
+	}
+
+	m.response = ResponseView{
+		Status:      "Exported",
+		Proto:       "-",
+		Duration:    "-",
+		Size:        formatBytes(len(curlCmd)),
+		HeaderLines: []string{},
+		BodyLabel:   "cURL",
+		BodyLines:   splitLines(curlCmd),
+	}
+	m.rebuildResponseContent()
+	m.message = "Copied cURL command to clipboard."
+	m.messageLevel = "success"
+	return m, nil
+}
+
+func copyToClipboard(text string) error {
+	return clipboard.WriteAll(text)
+}
+
+func (m *uiModel) currentRequestSpec() RequestSpec {
+	headers := make([]headerPair, 0, len(m.headerRows))
+	for _, row := range m.headerRows {
+		keyValue := strings.TrimSpace(row.keyInput.Value())
+		valueValue := strings.TrimSpace(row.valueInput.Value())
+		if keyValue == "" && valueValue == "" {
+			continue
+		}
+		headers = append(headers, headerPair{Key: keyValue, Value: valueValue})
+	}
+
+	return normalizeRequestSpec(RequestSpec{
+		Method:  m.methods[m.methodIndex],
+		URL:     m.urlInput.Value(),
+		Timeout: m.timeoutInput.Value(),
+		Headers: headers,
+		Body:    m.bodyInput.Value(),
+	})
+}
+
+func (m *uiModel) applyRequestSpec(request RequestSpec) {
+	request = normalizeRequestSpec(request)
+
+	m.setMethod(request.Method)
+	m.urlInput.SetValue(request.URL)
+	m.urlInput.CursorEnd()
+	timeoutValue := request.Timeout
+	if timeoutValue == "" {
+		timeoutValue = defaultTimeout.String()
+	}
+	m.timeoutInput.SetValue(timeoutValue)
+	m.timeoutInput.CursorEnd()
+	m.bodyInput.SetValue(request.Body)
+
+	if len(request.Headers) == 0 {
+		m.headerRows = []headerRow{newHeaderRow("", "")}
+	} else {
+		m.headerRows = make([]headerRow, 0, len(request.Headers))
+		for _, header := range request.Headers {
+			m.headerRows = append(m.headerRows, newHeaderRow(header.Key, header.Value))
+		}
+	}
+	m.selectedHeaderRow = 0
+	m.applyLayout()
+	m.syncFocus()
+}
+
+func (m *uiModel) appendHistory(request RequestSpec) error {
+	request = normalizeRequestSpec(request)
+	if isEmptyRequestSpec(request) {
+		return nil
+	}
+
+	entry := HistoryEntry{
+		SavedAt: time.Now(),
+		Request: request,
+	}
+
+	entries := make([]HistoryEntry, 0, len(m.historyEntries)+1)
+	entries = append(entries, entry)
+	for _, existing := range m.historyEntries {
+		if requestSpecsEqual(existing.Request, request) {
+			continue
+		}
+		entries = append(entries, existing)
+		if len(entries) >= maxHistoryEntries {
+			break
+		}
+	}
+
+	m.historyEntries = entries
+	m.selectedHistory = 0
+	m.applyLayout()
+	return saveHistory(m.historyPath, m.historyEntries)
+}
+
+func (m *uiModel) applySelectedHistory() bool {
+	if len(m.historyEntries) == 0 {
+		m.message = "History is empty."
+		m.messageLevel = "info"
+		return true
+	}
+
+	m.normalizeHistorySelection()
+	entry := m.historyEntries[m.selectedHistory]
+	m.applyRequestSpec(entry.Request)
+	m.message = fmt.Sprintf(
+		"Loaded history: %s %s",
+		entry.Request.Method,
+		truncateText(entry.Request.URL, 72),
+	)
+	m.messageLevel = "success"
+	return true
+}
+
+func (m *uiModel) deleteSelectedHistory() bool {
+	if len(m.historyEntries) == 0 {
+		m.message = "History is already empty."
+		m.messageLevel = "info"
+		return true
+	}
+
+	m.normalizeHistorySelection()
+	removed := m.historyEntries[m.selectedHistory]
+	m.historyEntries = append(m.historyEntries[:m.selectedHistory], m.historyEntries[m.selectedHistory+1:]...)
+	m.normalizeHistorySelection()
+	m.applyLayout()
+
+	if err := saveHistory(m.historyPath, m.historyEntries); err != nil {
+		m.message = fmt.Sprintf("History delete failed: %v", err)
+		m.messageLevel = "error"
+		return true
+	}
+
+	m.message = fmt.Sprintf(
+		"Deleted history: %s %s",
+		removed.Request.Method,
+		truncateText(removed.Request.URL, 72),
+	)
+	m.messageLevel = "success"
+	return true
+}
+
+func (m *uiModel) normalizeHistorySelection() {
+	if len(m.historyEntries) == 0 {
+		m.selectedHistory = 0
+		return
+	}
+	if m.selectedHistory < 0 {
+		m.selectedHistory = 0
+	}
+	if m.selectedHistory >= len(m.historyEntries) {
+		m.selectedHistory = len(m.historyEntries) - 1
+	}
+}
+
+func (m *uiModel) moveHistorySelection(delta int) {
+	if len(m.historyEntries) == 0 {
+		return
+	}
+	m.selectedHistory += delta
+	m.normalizeHistorySelection()
+}
+
+func requestCmd(request RequestSpec) tea.Cmd {
+	headers := make([]string, 0, len(request.Headers))
+	for _, header := range request.Headers {
+		headers = append(headers, fmt.Sprintf("%s: %s", header.Key, header.Value))
+	}
+
+	timeout, _ := parseTimeoutValue(request.Timeout)
+	return func() tea.Msg {
+		return requestDoneMsg{
+			result: performRequest(
+				request.Method,
+				request.URL,
+				timeout,
+				headers,
+				request.Body,
+			),
+			request: request,
+		}
+	}
 }
 
 func (m *uiModel) handleCurlPaste(raw string) bool {
@@ -445,6 +677,23 @@ func (m *uiModel) handleFocusedKey(msg tea.KeyMsg) bool {
 			m.messageLevel = "success"
 			return true
 		}
+
+	case focusHistory:
+		switch {
+		case key.Matches(msg, m.keys.DeleteHistory):
+			return m.deleteSelectedHistory()
+		case key.Matches(msg, m.keys.ApplyHistory):
+			return m.applySelectedHistory()
+		}
+
+		switch msg.String() {
+		case "up", "k":
+			m.moveHistorySelection(-1)
+			return true
+		case "down", "j":
+			m.moveHistorySelection(1)
+			return true
+		}
 	}
 
 	return false
@@ -480,6 +729,7 @@ func (m *uiModel) syncFocus() {
 		m.headerRows[m.selectedHeaderRow] = row
 	case focusBody:
 		m.bodyInput.Focus()
+	case focusHistory, focusResponse:
 	}
 }
 
@@ -626,9 +876,9 @@ func calculateLayout(width, height, headerCount int) uiLayout {
 	layout.responseViewportHeight = max(1, layout.responseContentHeight-responseFixedRows)
 
 	rowIndexWidth := 3
-	remaining := max(20, layout.requestContentWidth-rowIndexWidth-2)
-	layout.headerKeyWidth = max(12, remaining*34/100)
-	layout.headerValueWidth = max(12, remaining-layout.headerKeyWidth)
+	headerContentWidth := max(20, layout.requestContentWidth-rowIndexWidth-2)
+	layout.headerKeyWidth = max(12, headerContentWidth*34/100)
+	layout.headerValueWidth = max(12, headerContentWidth-layout.headerKeyWidth)
 
 	return layout
 }
@@ -660,14 +910,6 @@ func (m *uiModel) rebuildResponseContent() {
 
 	m.responseView.SetContent(strings.Join(lines, "\n"))
 	m.responseView.GotoTop()
-}
-
-func requestCmd(method, rawURL string, timeout time.Duration, headers []string, body string) tea.Cmd {
-	return func() tea.Msg {
-		return requestDoneMsg{
-			result: performRequest(method, rawURL, timeout, headers, body),
-		}
-	}
 }
 
 func (m uiModel) View() string {
@@ -751,6 +993,10 @@ func (m uiModel) renderShortcutStrip() string {
 		renderShortcut("ctrl+c", "quit"),
 	}
 
+	if m.width >= 100 {
+		items = append(items, renderShortcut("ctrl+e", "export"))
+	}
+
 	if m.width >= 112 {
 		items = append(items, m.renderFocusShortcutHints()...)
 	}
@@ -774,6 +1020,12 @@ func (m uiModel) renderFocusShortcutHints() []string {
 		}
 	case focusBody:
 		return []string{renderShortcut("ctrl+p", "format JSON")}
+	case focusHistory:
+		return []string{
+			renderShortcut("up/down", "history"),
+			renderShortcut("enter", "load"),
+			renderShortcut("ctrl+d", "delete"),
+		}
 	case focusResponse:
 		return []string{renderShortcut("pgup/pgdn", "scroll")}
 	default:
@@ -792,8 +1044,8 @@ func renderShortcut(keyText, desc string) string {
 
 func (m uiModel) renderRequestPane() string {
 	panelStyle := styles.panel
-	active := m.focus != focusResponse
-	if m.focus != focusResponse {
+	active := m.focus != focusResponse && m.focus != focusHistory
+	if active {
 		panelStyle = styles.panelActive
 	}
 	detail := "Tab to edit request"
@@ -823,21 +1075,35 @@ func (m uiModel) renderRequestPane() string {
 
 func (m uiModel) renderResponsePane() string {
 	panelStyle := styles.panel
-	active := m.focus == focusResponse
+	active := m.focus == focusResponse || m.focus == focusHistory
 	if active {
 		panelStyle = styles.panelActive
 	}
 	detail := "Tab to response"
-	if active {
+	if m.focus == focusHistory {
+		detail = "browse saved requests"
+	} else if active {
 		detail = "scroll response"
 	}
 
-	body := lipgloss.JoinVertical(
-		lipgloss.Left,
-		m.renderPaneTitle("RESPONSE", active, detail, m.layout.responseContentWidth),
-		m.renderResponseSummary(m.layout.responseContentWidth),
-		m.responseView.View(),
-	)
+	title := "RESPONSE"
+	var body string
+	if m.focus == focusHistory {
+		title = "HISTORY"
+		body = lipgloss.JoinVertical(
+			lipgloss.Left,
+			m.renderPaneTitle(title, active, detail, m.layout.responseContentWidth),
+			m.renderHistorySummary(m.layout.responseContentWidth),
+			m.renderHistoryBrowser(),
+		)
+	} else {
+		body = lipgloss.JoinVertical(
+			lipgloss.Left,
+			m.renderPaneTitle(title, active, detail, m.layout.responseContentWidth),
+			m.renderResponseSummary(m.layout.responseContentWidth),
+			m.responseView.View(),
+		)
+	}
 
 	content := lipgloss.NewStyle().
 		Width(m.layout.responseContentWidth).
@@ -1047,6 +1313,86 @@ func (m uiModel) renderArea(content string, active bool, width int) string {
 	return wrap.Width(width).MaxWidth(width).Render(content)
 }
 
+func (m uiModel) renderHistorySummary(width int) string {
+	summary := "No saved requests"
+	if len(m.historyEntries) > 0 {
+		selected := m.selectedHistory
+		if selected < 0 {
+			selected = 0
+		}
+		if selected >= len(m.historyEntries) {
+			selected = len(m.historyEntries) - 1
+		}
+		entry := m.historyEntries[selected]
+		summary = fmt.Sprintf(
+			"%s  timeout %s  %s",
+			entry.Request.Method,
+			fallbackHistoryValue(entry.Request.Timeout, defaultTimeout.String()),
+			entry.SavedAt.Local().Format("2006-01-02 15:04"),
+		)
+	}
+	return styles.field.
+		Width(max(10, width-styles.field.GetHorizontalFrameSize())).
+		MaxWidth(max(10, width-styles.field.GetHorizontalFrameSize())).
+		Render(truncateText(summary, max(10, width-styles.field.GetHorizontalFrameSize())))
+}
+
+func (m uiModel) renderHistoryBrowser() string {
+	visibleRows := max(1, m.layout.responseContentHeight-3)
+	offset := headerViewportStart(m.selectedHistory, visibleRows, len(m.historyEntries))
+	end := min(len(m.historyEntries), offset+visibleRows)
+	lines := []string{
+		sectionLineMeta("Saved Requests", historySummary(offset, end, len(m.historyEntries)), m.layout.responseContentWidth),
+	}
+
+	if len(m.historyEntries) == 0 {
+		lines = append(lines, styles.muted.Render("  No saved requests yet. Send a request to capture it here."))
+	} else {
+		for index := offset; index < end; index++ {
+			lines = append(lines, m.renderHistoryRow(index, m.layout.responseContentWidth))
+		}
+	}
+
+	lines = append(lines, styles.hint.Render("Enter load  Ctrl+D delete  Up/Down navigate"))
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+func (m uiModel) renderHistoryRow(index, width int) string {
+	entry := m.historyEntries[index]
+	selected := index == m.selectedHistory
+	active := selected && m.focus == focusHistory
+
+	rowStyle := styles.field
+	if selected {
+		rowStyle = styles.fieldSelected
+	}
+	if active {
+		rowStyle = styles.fieldActive
+	}
+
+	contentWidth := max(10, width-rowStyle.GetHorizontalFrameSize())
+	marker := " "
+	if selected {
+		marker = ">"
+	}
+	markerPart := styles.headerValue.Render(marker)
+	datePart := styles.hint.Render(entry.SavedAt.Local().Format("01-02 15:04"))
+	methodPart := methodLipgloss(entry.Request.Method).Render(entry.Request.Method)
+	urlWidth := max(6, contentWidth-lipgloss.Width(markerPart)-lipgloss.Width(datePart)-lipgloss.Width(methodPart)-3)
+	urlPart := styles.text.Render(truncateText(entry.Request.URL, urlWidth))
+
+	line := lipgloss.JoinHorizontal(lipgloss.Top, markerPart, " ", datePart, " ", methodPart, " ", urlPart)
+	return rowStyle.Width(contentWidth).MaxWidth(contentWidth).Render(line)
+}
+
+func fallbackHistoryValue(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
 func headerEditorSummary(start, end, total int) string {
 	if total == 0 {
 		return "0 rows"
@@ -1055,6 +1401,16 @@ func headerEditorSummary(start, end, total int) string {
 		return pluralize(total, "row", "rows")
 	}
 	return fmt.Sprintf("%d-%d/%d rows", start+1, end, total)
+}
+
+func historySummary(start, end, total int) string {
+	if total == 0 {
+		return "empty"
+	}
+	if start == 0 && end >= total {
+		return pluralize(total, "entry", "entries")
+	}
+	return fmt.Sprintf("%d-%d/%d entries", start+1, end, total)
 }
 
 func bodySummary(body string) string {
@@ -1116,6 +1472,8 @@ func (m uiModel) focusLabel() string {
 		return "header value"
 	case focusBody:
 		return "body"
+	case focusHistory:
+		return "history"
 	case focusResponse:
 		return "response"
 	default:
@@ -1139,6 +1497,8 @@ func (m uiModel) ShortHelp() []key.Binding {
 		bindings = append(bindings, m.keys.HeaderRowNav, m.keys.HeaderFieldSwitch, m.keys.AddHeader, m.keys.DeleteHeader)
 	case focusBody:
 		bindings = append(bindings, m.keys.FormatJSON)
+	case focusHistory:
+		bindings = append(bindings, m.keys.HistoryNav, m.keys.ApplyHistory, m.keys.DeleteHistory)
 	case focusResponse:
 		bindings = append(bindings, m.keys.ResponseNav)
 	}

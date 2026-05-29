@@ -7,6 +7,8 @@
 - 终端内编辑 `method / url / timeout / headers / body`
 - 使用 TUI 界面发送请求和查看响应
 - 直接粘贴浏览器复制的 `curl` 并应用到当前请求
+- 将当前请求导出为 `curl` 命令并复制到剪贴板
+- 自动保存请求历史，并在下次启动时恢复
 - 自动补全 URL 协议
 - JSON 响应自动格式化
 - 二进制响应自动转十六进制预览
@@ -52,7 +54,8 @@ env GOCACHE=/tmp/go-build-cache GOPROXY=off GOSUMDB=off GOFLAGS=-mod=mod go run 
 4. 编辑请求头
 5. 编辑请求体
 6. 按 `Ctrl+S` 发送请求
-7. 在响应区滚动查看结果
+7. 按 `Tab` 切到 `History` 浏览最近请求，按 `Enter` 回填
+8. 在响应区滚动查看结果
 
 也可以在浏览器开发者工具里使用 `Copy as cURL`，回到 TermReq 后在任意焦点位置直接粘贴。TermReq 会自动导入 `method / url / headers / body`。
 
@@ -63,12 +66,14 @@ env GOCACHE=/tmp/go-build-cache GOPROXY=off GOSUMDB=off GOFLAGS=-mod=mod go run 
 | `Tab` | 切换到下一个区域 |
 | `Shift+Tab` | 切换到上一个区域 |
 | `Ctrl+S` | 发送请求 |
+| `Ctrl+E` | 导出当前请求为 cURL 命令并复制到剪贴板 |
 | `Ctrl+C` | 退出 |
 | `Left / Right` 或 `h / l` | 在方法区域切换 Method，或在 Header 区切换 `key/value` |
 | `Up / Down` 或 `j / k` | 在 Header 行之间移动，或在响应区滚动 |
 | `Ctrl+N` | 在 Header 区新增一行 |
 | `Ctrl+D` | 在 Header 区删除当前行 |
 | `Ctrl+P` | 在 Body 区格式化 JSON |
+| `Enter` | 在 History 区加载当前选中的历史请求 |
 | `PageUp / PageDown` | 在响应区翻页 |
 | `Home / End` | 在响应区跳到顶部或底部 |
 
@@ -105,6 +110,14 @@ env GOCACHE=/tmp/go-build-cache GOPROXY=off GOSUMDB=off GOFLAGS=-mod=mod go run 
 - 二进制内容会显示十六进制 dump
 - 默认 `User-Agent` 是 `TermReq/1.0`
 
+### History
+
+- 每次发送请求后都会自动写入本地历史
+- 历史默认保存在用户配置目录下的 `termreq/history.json`
+- 历史会在下次启动时自动加载
+- 相同请求会被移动到顶部，不会无限重复堆积
+- 在 `History` 焦点下可用 `Up / Down` 浏览、`Enter` 回填、`Ctrl+D` 删除
+
 ## 项目结构
 
 - [main.go](./main.go): 程序入口
@@ -133,7 +146,6 @@ go build ./...
 
 如果后面继续扩展，比较自然的方向有：
 
-- 请求历史
 - 收藏夹
 - Header / Body 标签页
 - 更细的响应信息面板

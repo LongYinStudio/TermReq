@@ -432,3 +432,101 @@ func appendQueryData(rawURL, data string) (string, error) {
 	}
 	return parsed.String(), nil
 }
+
+func exportCurlCommand(spec RequestSpec) string {
+	spec = normalizeRequestSpec(spec)
+
+	var parts []string
+	parts = append(parts, "curl")
+
+	method := strings.ToUpper(strings.TrimSpace(spec.Method))
+	if method != "" && method != "GET" {
+		parts = append(parts, "-X", method)
+	}
+
+	timeout := strings.TrimSpace(spec.Timeout)
+	if timeout != "" {
+		if duration, err := parseTimeoutValue(timeout); err == nil {
+			seconds := int(duration.Seconds())
+			if seconds > 0 {
+				parts = append(parts, "--max-time", fmt.Sprintf("%d", seconds))
+			}
+		}
+	}
+
+	for _, header := range spec.Headers {
+		key := strings.TrimSpace(header.Key)
+		value := strings.TrimSpace(header.Value)
+		if key == "" {
+			continue
+		}
+		parts = append(parts, "-H", quoteCurlHeader(fmt.Sprintf("%s: %s", key, value)))
+	}
+
+	body := strings.TrimSpace(spec.Body)
+	if body != "" {
+		parts = append(parts, "-d", quoteCurlBody(body))
+	}
+
+	parts = append(parts, quoteCurlURL(spec.URL))
+
+	return strings.Join(parts, " ")
+}
+
+func quoteCurlURL(rawURL string) string {
+	if rawURL == "" {
+		return "''"
+	}
+
+	needsQuote := false
+	for _, r := range rawURL {
+		if r == '\'' || r == '"' || r == ' ' || r == '\t' || r == '\n' || r == '\\' {
+			needsQuote = true
+			break
+		}
+	}
+
+	if !needsQuote {
+		return rawURL
+	}
+
+	var builder strings.Builder
+	builder.WriteRune('\'')
+	for _, r := range rawURL {
+		if r == '\'' {
+			builder.WriteString("'\\''")
+		} else {
+			builder.WriteRune(r)
+		}
+	}
+	builder.WriteRune('\'')
+	return builder.String()
+}
+
+func quoteCurlHeader(header string) string {
+	var builder strings.Builder
+	builder.WriteRune('\'')
+	for _, r := range header {
+		if r == '\'' {
+			builder.WriteString("'\\''")
+		} else {
+			builder.WriteRune(r)
+		}
+	}
+	builder.WriteRune('\'')
+	return builder.String()
+}
+
+func quoteCurlBody(body string) string {
+	var builder strings.Builder
+	builder.WriteRune('\'')
+	for _, r := range body {
+		if r == '\'' {
+			builder.WriteString("'\\''")
+		} else {
+			builder.WriteRune(r)
+		}
+	}
+	builder.WriteRune('\'')
+	return builder.String()
+}
